@@ -12,11 +12,6 @@ app.use(express.json());
 const server = new McpServer({
   name: "legal-th",
   version: "0.1.0",
-  capabilities: {
-    tools: {},
-    prompts: {},
-    resources: {},
-  },
 });
 
 // Register all MCP components
