@@ -1,0 +1,117 @@
+version: "3.8"
+
+services:
+  # ─── Core: LINE Bot + Claude Agent SDK ───
+  bot-service:
+    build: ./bot-service
+    container_name: legal-bot
+    ports:
+      - "3000:3000"
+    environment:
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AI_SERVER_URL=http://legal-mcp:4100
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-20250514}
+    depends_on:
+      - legal-mcp
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── legal-th MCP Server (Orchestrator) ───
+  legal-mcp:
+    build: ./legal-th/mcp-server
+    container_name: legal-mcp
+    ports:
+      - "4100:4100"
+    environment:
+      - RAG_URL=http://legal-rag:8000
+      - ODOO_MCP_URL=http://odoo-mcp:8000
+      - LINE_MCP_URL=http://line-oa-mcp:3001
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      - legal-rag
+      - chromadb
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── RAG Server (กฎหมายไทย) ───
+  legal-rag:
+    build: ./legal-rag
+    container_name: legal-rag
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - COLLECTION_NAME=thai_legal
+    volumes:
+      - ./legal-th/knowledge:/app/documents:ro
+    depends_on:
+      - chromadb
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── ChromaDB (Vector Store) ───
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: legal-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chromadb-data:/chroma/chroma
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── LINE OA MCP Server ───
+  line-oa-mcp:
+    build: ./line-oa-mcp
+    container_name: legal-line-mcp
+    ports:
+      - "3001:3001"
+    environment:
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - PORT=3001
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── Odoo MCP Server ───
+  odoo-mcp:
+    build: ./odoo-mcp
+    container_name: legal-odoo-mcp
+    ports:
+      - "8002:8000"
+    environment:
+      - ODOO_URL=${ODOO_URL}
+      - ODOO_DB=${ODOO_DB}
+      - ODOO_USERNAME=${ODOO_USERNAME}
+      - ODOO_PASSWORD=${ODOO_PASSWORD}
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── Cloudflare Tunnel ───
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: legal-tunnel
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+volumes:
+  chromadb-data:
+
+networks:
+  legal-net:
+    driver: bridge

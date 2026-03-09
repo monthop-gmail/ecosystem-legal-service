@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "legal-th": {
+      "url": "http://localhost:4100/mcp"
+    },
+    "line-oa": {
+      "url": "http://localhost:3001/mcp"
+    },
+    "odoo": {
+      "url": "http://localhost:8002/mcp"
+    },
+    "legal-rag": {
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
