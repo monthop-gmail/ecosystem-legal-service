@@ -1,13 +1,14 @@
 # Legal Service Ecosystem
 
-ระบบ Legal Service ที่ใช้ AI (Claude Code) เป็นตัวกลาง
+ระบบ Legal Service ที่ใช้ Claude Agent SDK เป็น AI Engine
 พร้อม Follow-up ผ่าน LINE LIFF และ Odoo ERP
 
 ## Services
 
 | Service | Port | Description |
 |---------|------|-------------|
-| bot-service | 3000 | LINE Bot + Claude Agent SDK |
+| line-bot | 3000 | LINE Webhook + Commands |
+| server | 4096 | Claude Code Server (Agent SDK) |
 | legal-mcp | 4100 | legal-th MCP Server (orchestrator) |
 | legal-rag | 8000 | RAG Server (Thai legal documents) |
 | line-oa-mcp | 3001 | LINE OA Messaging MCP (34 tools) |
@@ -27,10 +28,24 @@ docker compose up legal-mcp legal-rag chromadb
 curl -X POST http://localhost:8000/api/ingest
 
 # Health checks
+curl http://localhost:4096/health   # server
+curl http://localhost:3000/health   # line-bot
 curl http://localhost:4100/health   # legal-mcp
 curl http://localhost:8000/health   # legal-rag
-curl http://localhost:3000/health   # bot-service
 ```
+
+## Bot Service (2-Tier)
+
+```
+LINE Bot (port 3000) → Server (port 4096) → Claude Agent SDK → Anthropic API
+```
+
+- `bot-service/src/index.ts` — LINE bot: webhook, commands, reply-first + push fallback
+- `bot-service/server/src/index.ts` — Hono API server (routes, SSE, auth)
+- `bot-service/server/src/claude.ts` — Claude Agent SDK wrapper
+- `bot-service/server/src/session.ts` — Session manager (create/resume/abort)
+- `bot-service/server/src/events.ts` — SSE event bus
+- `workspace/AGENTS.md` — AI persona & rules for legal advisor
 
 ## MCP Tools (legal-th)
 
@@ -51,7 +66,7 @@ curl http://localhost:3000/health   # bot-service
 
 ## Architecture
 
-Modular microservices, each service is independent and communicable via MCP.
+2-Tier Bot Service (botforge template) + Modular MCP microservices.
 Clone dependent repos into `line-oa-mcp/` and `odoo-mcp/` directories.
 
 ## Related Repos
