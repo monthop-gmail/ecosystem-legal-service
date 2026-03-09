@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── TypeScript: legal-th MCP Server ───
+  legal-mcp:
+    name: legal-th MCP (tsc build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: legal-th/mcp-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npx tsc --noEmit
+
+  # ─── Bun: LINE Bot ───
+  line-bot:
+    name: LINE Bot (typecheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - run: bunx tsc --noEmit
+
+  # ─── Bun: Server ───
+  server:
+    name: Server (typecheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot-service/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - run: bunx tsc --noEmit
+
+  # ─── Python: RAG Server ───
+  legal-rag:
+    name: RAG Server (syntax check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: legal-rag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile main.py
+
+  # ─── Docker Compose: build all ───
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [legal-mcp, line-bot, server, legal-rag]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build line-bot server legal-mcp legal-rag
