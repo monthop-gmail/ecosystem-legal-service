@@ -7,6 +7,6 @@ RUN bun install
 
 COPY src/ src/
 
-EXPOSE 3000
+EXPOSE 4096
 
 CMD ["bun", "run", "src/index.ts"]

@@ -1,20 +1,43 @@
 version: "3.8"
 
 services:
-  # ─── Core: LINE Bot + Claude Agent SDK ───
-  bot-service:
+  # ─── Claude Code API Server (Agent SDK → Anthropic API) ───
+  server:
+    build: ./bot-service/server
+    container_name: legal-server
+    ports:
+      - "4096:4096"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - API_PASSWORD=${API_PASSWORD:-}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-sonnet}
+      - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-10}
+      - CLAUDE_MAX_BUDGET_USD=${CLAUDE_MAX_BUDGET_USD:-1.00}
+      - PORT=4096
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - ${PROJECT_DIR:-./workspace}:/workspace
+      # Mount host ~/.claude for OAuth credentials (no API key needed)
+      - ${CLAUDE_HOME:-~/.claude}:/home/claude/.claude
+    restart: unless-stopped
+    networks:
+      - legal-net
+
+  # ─── LINE Bot - bridges LINE messages to server ───
+  line-bot:
     build: ./bot-service
-    container_name: legal-bot
+    container_name: legal-line-bot
     ports:
       - "3000:3000"
     environment:
-      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
       - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - AI_SERVER_URL=http://legal-mcp:4100
-      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-20250514}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - SERVER_URL=http://server:4096
+      - SERVER_PASSWORD=${API_PASSWORD:-}
+      - PROMPT_TIMEOUT_MS=${PROMPT_TIMEOUT_MS:-300000}
+      - PORT=3000
     depends_on:
-      - legal-mcp
+      - server
     restart: unless-stopped
     networks:
       - legal-net
@@ -105,6 +128,8 @@ services:
     command: tunnel run
     environment:
       - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+    depends_on:
+      - line-bot
     restart: unless-stopped
     networks:
       - legal-net

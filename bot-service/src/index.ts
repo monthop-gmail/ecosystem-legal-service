@@ -1,105 +1,402 @@
-import { Hono } from "hono";
-import { Client, validateSignature, WebhookEvent, TextMessage } from "@line/bot-sdk";
+import { messagingApi } from "@line/bot-sdk"
+import { createHmac } from "node:crypto"
 
-const app = new Hono();
+// --- Config ---
+const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN
+const channelSecret = process.env.LINE_CHANNEL_SECRET
+const port = Number(process.env.PORT ?? 3000)
+const serverUrl = process.env.SERVER_URL ?? "http://server:4096"
+const serverPassword = process.env.SERVER_PASSWORD
+const timeoutMs = Number(process.env.PROMPT_TIMEOUT_MS ?? 300_000)
 
-const lineConfig = {
-  channelSecret: process.env.LINE_CHANNEL_SECRET || "",
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || "",
-};
+if (!channelAccessToken || !channelSecret) {
+  console.error("Missing LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
+  process.exit(1)
+}
 
-const lineClient = new Client(lineConfig);
-const AI_SERVER_URL = process.env.AI_SERVER_URL || "http://legal-mcp:4100";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
+console.log("Legal Bot LINE configuration:")
+console.log("- Server URL:", serverUrl)
+console.log("- Server auth:", serverPassword ? "enabled" : "disabled")
+console.log("- Timeout:", `${timeoutMs}ms`)
 
-// Session storage (PoC - use Redis in production)
-const sessions = new Map<string, { messages: Array<{ role: string; content: string }> }>();
+// --- LINE Client ---
+const lineClient = new messagingApi.MessagingApiClient({ channelAccessToken })
 
-app.get("/health", (c) => c.json({ status: "ok", service: "legal-bot" }));
+// --- Server HTTP Client ---
+const serverAuth = serverPassword ? `Bearer ${serverPassword}` : ""
 
-// LINE Webhook
-app.post("/webhook", async (c) => {
-  const body = await c.req.text();
-  const signature = c.req.header("x-line-signature") || "";
+async function serverRequest(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<any> {
+  const headers: Record<string, string> = {}
+  if (serverAuth) headers["Authorization"] = serverAuth
+  if (body !== undefined) headers["Content-Type"] = "application/json"
 
-  if (!validateSignature(body, lineConfig.channelSecret, signature)) {
-    return c.text("Invalid signature", 401);
-  }
+  const resp = await fetch(`${serverUrl}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: signal ?? AbortSignal.timeout(timeoutMs),
+  })
 
-  const events: WebhookEvent[] = JSON.parse(body).events;
-
-  for (const event of events) {
-    if (event.type === "message" && event.message.type === "text") {
-      await handleTextMessage(event);
-    }
-  }
-
-  return c.json({ status: "ok" });
-});
-
-async function handleTextMessage(event: WebhookEvent & { message: { text: string } }) {
-  const userId = event.source.userId || "unknown";
-  const userMessage = event.message.text;
-
-  // Get or create session
-  if (!sessions.has(userId)) {
-    sessions.set(userId, { messages: [] });
-  }
-  const session = sessions.get(userId)!;
-  session.messages.push({ role: "user", content: userMessage });
-
-  // Keep only last 20 messages
-  if (session.messages.length > 20) {
-    session.messages = session.messages.slice(-20);
-  }
-
+  const text = await resp.text()
+  if (!resp.ok) throw new Error(`Server ${resp.status}: ${text.slice(0, 300)}`)
   try {
-    // Call Claude API with MCP tools
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: CLAUDE_MODEL,
-        max_tokens: 2048,
-        system: `คุณเป็น AI ที่ปรึกษากฎหมายไทย ให้คำปรึกษาเบื้องต้นเป็นภาษาไทย
-อ้างอิงมาตรากฎหมายเสมอ แจ้งว่าเป็นคำปรึกษาเบื้องต้น
-LINE User ID ของลูกค้า: ${userId}`,
-        messages: session.messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
-      }),
-    });
-
-    const data = await response.json() as {
-      content: Array<{ type: string; text?: string }>;
-    };
-    const aiReply =
-      data.content?.find((c: { type: string }) => c.type === "text")?.text ||
-      "ขออภัย ไม่สามารถประมวลผลได้ในขณะนี้";
-
-    session.messages.push({ role: "assistant", content: aiReply });
-
-    // Reply via LINE
-    const replyMessage: TextMessage = { type: "text", text: aiReply };
-    await lineClient.replyMessage(
-      (event as unknown as { replyToken: string }).replyToken,
-      replyMessage
-    );
-  } catch (error) {
-    console.error("Error:", error);
-    await lineClient.replyMessage(
-      (event as unknown as { replyToken: string }).replyToken,
-      { type: "text", text: "ขออภัย ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง" }
-    );
+    return JSON.parse(text)
+  } catch {
+    return text
   }
 }
 
-const PORT = Number(process.env.PORT) || 3000;
-console.log(`🤖 Legal Bot running on port ${PORT}`);
-export default { port: PORT, fetch: app.fetch };
+// --- Session Management ---
+interface UserSession {
+  sessionId: string
+  totalCost: number
+}
+
+const sessions = new Map<string, UserSession>()
+const userQueues = new Map<string, Promise<void>>()
+
+// --- Per-user request queue ---
+function enqueueForUser<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = userQueues.get(userId) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  userQueues.set(
+    userId,
+    next.then(
+      () => {},
+      () => {},
+    ),
+  )
+  return next
+}
+
+// --- LINE Signature Validation ---
+function validateSignature(body: string, signature: string): boolean {
+  const hash = createHmac("SHA256", channelSecret!)
+    .update(body)
+    .digest("base64")
+  return hash === signature
+}
+
+// --- Chunk long messages for LINE (max 5000 chars) ---
+const LINE_MAX_TEXT = 5000
+
+function chunkText(text: string, limit: number = LINE_MAX_TEXT): string[] {
+  if (text.length <= limit) return [text]
+
+  const chunks: string[] = []
+  let remaining = text
+
+  while (remaining.length > 0) {
+    if (remaining.length <= limit) {
+      chunks.push(remaining)
+      break
+    }
+
+    let breakAt = remaining.lastIndexOf("\n", limit)
+    if (breakAt < limit * 0.3) {
+      breakAt = remaining.lastIndexOf(" ", limit)
+    }
+    if (breakAt < limit * 0.3) {
+      breakAt = limit
+    }
+
+    const chunk = remaining.slice(0, breakAt)
+    remaining = remaining.slice(breakAt).trimStart()
+
+    // Handle unclosed code blocks
+    const backtickCount = (chunk.match(/```/g) || []).length
+    if (backtickCount % 2 !== 0) {
+      chunks.push(chunk + "\n```")
+      remaining = "```\n" + remaining
+    } else {
+      chunks.push(chunk)
+    }
+  }
+
+  return chunks
+}
+
+// --- Send long message via Push API ---
+async function sendMessage(userId: string, text: string): Promise<void> {
+  const chunks = chunkText(text)
+  for (const chunk of chunks) {
+    await lineClient
+      .pushMessage({
+        to: userId,
+        messages: [{ type: "text", text: chunk }],
+      })
+      .catch((err: any) => {
+        console.error("Failed to send LINE message:", err?.message ?? err)
+      })
+  }
+}
+
+// --- Send prompt to server ---
+async function sendPrompt(
+  userId: string,
+  prompt: string,
+): Promise<{ result: string; cost: number; isError: boolean }> {
+  const session = sessions.get(userId)
+
+  // Create session if needed
+  if (!session) {
+    const created = await serverRequest("POST", "/session")
+    sessions.set(userId, { sessionId: created.id, totalCost: 0 })
+    console.log(`[${userId.slice(-8)}] Created session: ${created.id}`)
+  }
+
+  const { sessionId } = sessions.get(userId)!
+
+  console.log(`[${userId.slice(-8)}] Sending prompt to session ${sessionId}`)
+
+  try {
+    const result = await serverRequest(
+      "POST",
+      `/session/${sessionId}/message`,
+      { prompt },
+    )
+
+    const cost = result.cost_usd ?? 0
+    const s = sessions.get(userId)!
+    s.totalCost += cost
+
+    return {
+      result: result.result ?? "Done. (no text output)",
+      cost,
+      isError: result.is_error ?? false,
+    }
+  } catch (err: any) {
+    // If session expired or not found, create fresh and retry
+    if (
+      err?.message?.includes("404") ||
+      err?.message?.includes("not found") ||
+      err?.message?.includes("No conversation")
+    ) {
+      console.log(`[${userId.slice(-8)}] Session expired, creating fresh`)
+      sessions.delete(userId)
+      return sendPrompt(userId, prompt)
+    }
+    throw err
+  }
+}
+
+// --- Handle incoming LINE message ---
+async function handleTextMessage(
+  userId: string,
+  text: string,
+  replyToken: string,
+): Promise<void> {
+  console.log(`Message from ${userId}: ${text}`)
+
+  // --- Commands ---
+  if (text.toLowerCase() === "/new") {
+    const session = sessions.get(userId)
+    if (session) {
+      await serverRequest("DELETE", `/session/${session.sessionId}`).catch(
+        () => {},
+      )
+    }
+    sessions.delete(userId)
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [
+        {
+          type: "text",
+          text: "เริ่มบทสนทนาใหม่แล้วค่ะ พิมพ์ปัญหากฎหมายได้เลย",
+        },
+      ],
+    })
+    return
+  }
+
+  if (text.toLowerCase() === "/abort") {
+    const session = sessions.get(userId)
+    if (session) {
+      const res = await serverRequest(
+        "POST",
+        `/session/${session.sessionId}/abort`,
+      ).catch(() => ({ aborted: false }))
+      if (res.aborted) {
+        await lineClient.replyMessage({
+          replyToken,
+          messages: [{ type: "text", text: "ยกเลิกคำขอแล้วค่ะ" }],
+        })
+        return
+      }
+    }
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [{ type: "text", text: "ไม่มีคำขอที่กำลังทำงานอยู่ค่ะ" }],
+    })
+    return
+  }
+
+  if (text.toLowerCase() === "/sessions") {
+    const session = sessions.get(userId)
+    if (session) {
+      const info = await serverRequest(
+        "GET",
+        `/session/${session.sessionId}`,
+      ).catch(() => null)
+      const msg = info
+        ? `Session: ${session.sessionId}\nCost: $${session.totalCost.toFixed(4)}\nStatus: ${info.status}`
+        : `Session: ${session.sessionId}\nCost: $${session.totalCost.toFixed(4)}`
+      await lineClient.replyMessage({
+        replyToken,
+        messages: [{ type: "text", text: msg }],
+      })
+    } else {
+      await lineClient.replyMessage({
+        replyToken,
+        messages: [
+          {
+            type: "text",
+            text: "ยังไม่มี session ค่ะ ส่งข้อความมาเพื่อเริ่มปรึกษาได้เลย",
+          },
+        ],
+      })
+    }
+    return
+  }
+
+  if (text.toLowerCase() === "/about" || text.toLowerCase() === "/who") {
+    const aboutMsg = `สวัสดีค่ะ! ดิฉันเป็น AI ที่ปรึกษากฎหมายไทย
+
+ให้คำปรึกษาเบื้องต้นด้านกฎหมายไทย
+อ้างอิงมาตรากฎหมาย พ.ร.บ. คำพิพากษา
+พร้อมนัดหมายพบทนาย ร่างเอกสาร ประเมินค่าบริการ
+
+GitHub: https://github.com/monthop-gmail/ecosystem-legal-service
+พิมพ์ /help ดูคำสั่งทั้งหมด`
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [{ type: "text", text: aboutMsg }],
+    })
+    return
+  }
+
+  if (text.toLowerCase() === "/help" || text.toLowerCase() === "/คำสั่ง") {
+    const helpMsg = `คำสั่งทั้งหมด:
+
+ทั่วไป
+  /about — แนะนำตัว bot
+  /help — คำสั่งทั้งหมด
+
+Session
+  /new — เริ่มบทสนทนาใหม่
+  /abort — ยกเลิก prompt ที่กำลังทำ
+  /sessions — ดูสถานะ session + cost
+  /cost — ดูค่าใช้จ่าย
+
+วิธีใช้งาน:
+  พิมพ์ปัญหากฎหมายได้เลย เช่น
+  "ถูกเลิกจ้างไม่เป็นธรรม ทำงานมา 5 ปี"
+  "อยากร่างสัญญาเช่า"
+  "นัดพบทนาย"`
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [{ type: "text", text: helpMsg }],
+    })
+    return
+  }
+
+  if (text.toLowerCase() === "/cost") {
+    const session = sessions.get(userId)
+    const msg = session
+      ? `ค่าใช้จ่ายรวม: $${session.totalCost.toFixed(4)}`
+      : "ยังไม่มี session ค่ะ"
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [{ type: "text", text: msg }],
+    })
+    return
+  }
+
+  // --- Enqueue prompt ---
+  enqueueForUser(userId, async () => {
+    try {
+      const { result, cost, isError } = await sendPrompt(userId, text)
+
+      let responseText = result
+      if (cost > 0) {
+        responseText += `\n\n[cost: $${cost.toFixed(4)}]`
+      }
+      if (isError) {
+        responseText = `Error: ${result}`
+      }
+
+      console.log(
+        `[${userId.slice(-8)}] Response: ${responseText.length} chars, cost: $${cost.toFixed(4)}`,
+      )
+      await sendMessage(userId, responseText)
+    } catch (err: any) {
+      console.error("Prompt error:", err?.message)
+      await sendMessage(
+        userId,
+        `ขออภัย เกิดข้อผิดพลาด: ${err?.message?.slice(0, 200) ?? "Unknown error"}`,
+      )
+    }
+  })
+}
+
+// --- HTTP Server for LINE Webhook ---
+Bun.serve({
+  port,
+  async fetch(req: Request) {
+    const url = new URL(req.url)
+
+    if (req.method === "GET" && url.pathname === "/") {
+      return new Response("Legal Bot LINE service is running")
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      return Response.json({ status: "ok", service: "legal-line-bot" })
+    }
+
+    if (req.method === "POST" && url.pathname === "/webhook") {
+      const body = await req.text()
+      const signature = req.headers.get("x-line-signature") || ""
+
+      if (!validateSignature(body, signature)) {
+        console.error("Invalid LINE signature")
+        return new Response("Invalid signature", { status: 403 })
+      }
+
+      let parsed: { events: any[] }
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        return new Response("Invalid JSON", { status: 400 })
+      }
+
+      for (const event of parsed.events) {
+        if (
+          event.type === "message" &&
+          event.message?.type === "text" &&
+          event.source?.userId
+        ) {
+          handleTextMessage(
+            event.source.userId,
+            event.message.text,
+            event.replyToken,
+          ).catch((err) => {
+            console.error("Error handling message:", err)
+          })
+        }
+      }
+
+      return new Response("OK")
+    }
+
+    return new Response("Not Found", { status: 404 })
+  },
+})
+
+console.log(
+  `Legal Bot LINE service listening on http://localhost:${port}/webhook`,
+)
