@@ -121,9 +121,40 @@ function chunkText(text: string, limit: number = LINE_MAX_TEXT): string[] {
   return chunks
 }
 
-// --- Send long message via Push API ---
-async function sendMessage(userId: string, text: string): Promise<void> {
+// --- Send message: try replyMessage first, fallback to pushMessage ---
+async function sendMessage(
+  userId: string,
+  text: string,
+  replyToken?: string,
+): Promise<void> {
   const chunks = chunkText(text)
+
+  // First chunk: try replyMessage (free, no quota)
+  if (replyToken && chunks.length > 0) {
+    try {
+      await lineClient.replyMessage({
+        replyToken,
+        messages: [{ type: "text", text: chunks[0] }],
+      })
+      // Remaining chunks via push
+      for (let i = 1; i < chunks.length; i++) {
+        await lineClient
+          .pushMessage({
+            to: userId,
+            messages: [{ type: "text", text: chunks[i] }],
+          })
+          .catch((err: any) => {
+            console.error("Failed to push remaining chunk:", err?.message ?? err)
+          })
+      }
+      return
+    } catch (err: any) {
+      // replyToken expired (30s timeout) — fallback to push for all chunks
+      console.log(`[${userId.slice(-8)}] replyToken expired, fallback to pushMessage`)
+    }
+  }
+
+  // Fallback: pushMessage for all chunks
   for (const chunk of chunks) {
     await lineClient
       .pushMessage({
@@ -333,12 +364,13 @@ Session
       console.log(
         `[${userId.slice(-8)}] Response: ${responseText.length} chars, cost: $${cost.toFixed(4)}`,
       )
-      await sendMessage(userId, responseText)
+      await sendMessage(userId, responseText, replyToken)
     } catch (err: any) {
       console.error("Prompt error:", err?.message)
       await sendMessage(
         userId,
         `ขออภัย เกิดข้อผิดพลาด: ${err?.message?.slice(0, 200) ?? "Unknown error"}`,
+        replyToken,
       )
     }
   })
